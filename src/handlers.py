@@ -1,7 +1,7 @@
 import logging
 from random import choice
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from config import CHATGPT_TOKEN
@@ -28,6 +28,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'random': 'Дізнатися випадковий факт',
             'gpt': 'Запитати ChatGPT',
             'talk': 'Діалог з відомою особистістю',
+            'translator': 'Перекладач',
+            'recommendations': 'Рекомендації кіно, музики, фільмів'
         }
     )
 
@@ -77,47 +79,67 @@ async def gpt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
     conversation_state = context.user_data.get("conversation_state")
+
+    # Перекладач
+    if conversation_state == "translator":
+        waiting_message = await send_text(update, context, "Перекладаю ...")
+        try:
+            language = context.user_data.get("translator_language")
+            prompt = f"Переклади наступний текст на {language}:\n{message_text}"
+            response = await chatgpt_service.send_question(prompt, message_text)
+            buttons = {
+                'translator': "Змінити мову",
+                'start': "Закінчити"
+            }
+            await send_text_buttons(update, context, response, buttons)
+        finally:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
+        return
+
+    # Рекомендації
+    if conversation_state == "recommendations":
+        waiting_message = await send_text(update, context, "Шукаю рекомендацію ...")
+        try:
+            category = context.user_data.get("recommendation_category")
+            prompt = f"Зроби рекомендацію для категорії '{category}' з жанром '{message_text}'."
+            context.user_data["last_recommendation_prompt"] = prompt
+            response = await chatgpt_service.send_question(prompt, message_text)
+            buttons = {
+                'rec_dislike': "Не подобається",
+                'start': "Закінчити"
+            }
+            await send_text_buttons(update, context, response, buttons)
+        finally:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
+        return
+
     if conversation_state == "gpt":
         waiting_message = await send_text(update, context, "...")
         try:
             response = await chatgpt_service.add_message(message_text)
             await send_text(update, context, response)
-        except Exception as e:
-            logger.error(f"Помилка при отриманні відповіді від ChatGPT: {e}")
-            await send_text(update, context, "Виникла помилка при обробці вашого повідомлення.")
         finally:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=waiting_message.message_id
-            )
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
+        return
+
     if conversation_state == "talk":
         personality = context.user_data.get("selected_personality")
-        if personality:
-            prompt = load_prompt(personality)
-            chatgpt_service.set_prompt(prompt)
-        else:
-            await send_text(update, context, "Спочатку оберіть особистість для розмови!")
+        if not personality:
+            await send_text(update, context, "Спочатку оберіть особистість!")
             return
+        prompt = load_prompt(personality)
+        chatgpt_service.set_prompt(prompt)
         waiting_message = await send_text(update, context, "...")
         try:
             response = await chatgpt_service.add_message(message_text)
             buttons = {"start": "Закінчити"}
             personality_name = personality.replace("talk_", "").replace("_", " ").title()
             await send_text_buttons(update, context, f"{personality_name}: {response}", buttons)
-        except Exception as e:
-            logger.error(f"Помилка при отриманні відповіді від ChatGPT: {e}")
-            await send_text(update, context, "Виникла помилка при отриманні відповіді!")
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
         finally:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=waiting_message.message_id
-            )
-    if not conversation_state:
-        intent_recognized = await inter_random_input(update, context, message_text)
-        if not intent_recognized:
-            await show_funny_response(update, context)
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
         return
+
+    await inter_random_input(update, context, message_text)
 
 
 async def talk(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,3 +233,120 @@ async def show_funny_response(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     full_message = f"{random_response}\n{available_commands}"
     await update.message.reply_text(full_message)
+
+async def translator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await send_image(update, context, "translator")
+    languages = {
+        'lang_en': 'Англійська',
+        'lang_es': 'Іспанська',
+        'lang_fr': 'Французька',
+        'lang_de': 'Німецька',
+        'start': 'Закінчити'
+    }
+    await send_text_buttons(update, context, "Оберіть мову для перекладу:", languages)
+
+async def translator_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'start':
+        context.user_data.pop("conversation_state", None)
+        context.user_data.pop("translator_language", None)
+        await start(update, context)
+        return
+
+    if data.startswith("lang_"):
+        language_code = data.split("_")[1]
+        context.user_data["translator_language"] = language_code
+        context.user_data["conversation_state"] = "translator"
+        await send_text(update, context, f"Ви обрали {query.data[5:].capitalize()}. Надішліть текст для перекладу:")
+
+async def handle_translator_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conversation_state = context.user_data.get("conversation_state")
+    if conversation_state != "translator":
+        return False  # не обробляємо, якщо не в режимі перекладача
+
+    language = context.user_data.get("translator_language")
+    text_to_translate = update.message.text
+
+    waiting_message = await send_text(update, context, "Перекладаю ...")
+    try:
+        prompt = f"Переклади наступний текст на {language}:\n{text_to_translate}"
+        response = await chatgpt_service.send_question(prompt, text_to_translate)
+        buttons = {
+            'start': "Закінчити",
+            'translator': "Змінити мову"
+        }
+        await send_text_buttons(update, context, response, buttons)
+    finally:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
+    return True
+
+async def recommendations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await send_image(update, context, "recommendations")
+    categories = {
+        'rec_movies': "Фільми",
+        'rec_books': "Книги",
+        'rec_music': "Музика",
+        'start': "Закінчити"
+    }
+    await send_text_buttons(update, context, "Оберіть категорію рекомендацій:", categories)
+
+async def recommendations_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "start":
+        context.user_data.clear()
+        await start(update, context)
+        return
+
+    if data.startswith("rec_"):
+        category = data[4:]
+        context.user_data["recommendation_category"] = category
+        context.user_data["conversation_state"] = "recommendations"
+        await send_text(update, context, f"Вкажіть жанр для {category}:")
+
+async def handle_recommendations_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conversation_state = context.user_data.get("conversation_state")
+    if conversation_state != "recommendations":
+        return False  # не обробляємо, якщо не в режимі рекомендацій
+
+    category = context.user_data.get("recommendation_category")
+    genre = update.message.text
+
+    waiting_message = await send_text(update, context, "Шукаю рекомендацію ...")
+    try:
+        prompt = f"Зроби рекомендацію для категорії '{category}' з жанром '{genre}'."
+        response = await chatgpt_service.send_question(prompt, genre)
+        buttons = {
+            'rec_dislike': "Не подобається",
+            'start': "Закінчити"
+        }
+        context.user_data["last_recommendation_prompt"] = prompt
+        await send_text_buttons(update, context, response, buttons)
+    finally:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
+    return True
+
+async def recommendation_dislike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prompt = context.user_data.get("last_recommendation_prompt")
+    if not prompt:
+        await start(update, context)
+        return
+    waiting_message = await send_text(update, context, "Генерую нову рекомендацію ...")
+    try:
+        response = await chatgpt_service.send_question(prompt, "Зроби інший варіант, будь ласка.")
+        buttons = {
+            'rec_dislike': "Не подобається",
+            'start': "Закінчити"
+        }
+        await send_text_buttons(update, context, response, buttons)
+    finally:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=waiting_message.message_id)
